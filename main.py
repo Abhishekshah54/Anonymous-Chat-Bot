@@ -20,6 +20,38 @@ PRIVATE_CHAT_DIR = BASE_DIR / '__chat_user__'
 CHAT_DIR = BASE_DIR / 'chat_user'
 
 
+def reply_safe(update: Update, text: str, **kwargs) -> None:
+    message = getattr(update, 'message', None)
+    if not message:
+        return
+    try:
+        message.reply_text(text, **kwargs)
+    except Exception:
+        logger.exception("Failed to send reply to user")
+
+
+def iter_user_records():
+    if not LOG_FILE.exists():
+        return
+    try:
+        with open(LOG_FILE, 'r') as log_file:
+            for line_number, line in enumerate(log_file, start=1):
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    data = eval(raw)
+                except Exception:
+                    logger.warning("Skipping malformed record in login.log at line %s", line_number)
+                    continue
+                if isinstance(data, dict):
+                    yield data
+                else:
+                    logger.warning("Skipping non-dict record in login.log at line %s", line_number)
+    except OSError:
+        logger.exception("Unable to read user records from %s", LOG_FILE)
+
+
 def ensure_storage() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     LOG_FILE.touch(exist_ok=True)
@@ -50,74 +82,95 @@ def start(update: Update, context: CallbackContext) -> None:
 
 # Command: /registration
 def registration_start(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text("Please enter your desired username:")
+    reply_safe(update, "Please enter your desired username:")
     return USERNAME
 
 
 def registration_username(update: Update, context: CallbackContext) -> int:
-    username = update.message.text
+    username = (update.message.text or '').strip()
+
+    if len(username) < 3:
+        reply_safe(update, "Username must be at least 3 characters. Please enter another username:")
+        return USERNAME
 
     # Check if the username is already in use
     if is_username_exists(username):
-        update.message.reply_text("Username already exists. Please choose another username:")
+        reply_safe(update, "Username already exists. Please choose another username:")
         return USERNAME
 
     context.user_data['username'] = username
-    update.message.reply_text("Please enter your password:")
+    reply_safe(update, "Please enter your password:")
     return PASSWORD
 
 
 def registration_password(update: Update, context: CallbackContext) -> int:
-    context.user_data['password'] = update.message.text
-    update.message.reply_text("Please tap the button below to share your vCard:")
+    password = (update.message.text or '').strip()
+    if len(password) < 4:
+        reply_safe(update, "Password must be at least 4 characters. Please enter your password again:")
+        return PASSWORD
+
+    context.user_data['password'] = password
+    reply_safe(update, "Please tap the button below to share your vCard:")
     button = KeyboardButton(text="Share vCard", request_contact=True)
     keyboard = [[button]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    update.message.reply_text("Please tap the button below to share your vCard:", reply_markup=reply_markup)
+    reply_safe(update, "Please tap the button below to share your vCard:", reply_markup=reply_markup)
     return PHONE_NUMBER
 
 
 def registration_phone_number(update: Update, context: CallbackContext) -> int:
     if update.message.contact:
-        phone_number = update.message.contact.phone_number
+        phone_number = (update.message.contact.phone_number or '').strip()
+
+        if not phone_number:
+            reply_safe(update, "Invalid contact detected. Please share your contact again using the button.")
+            return PHONE_NUMBER
 
         # Check if the phone number is already in use
         if is_phone_number_exists(phone_number):
-            update.message.reply_text(
+            reply_safe(update,
                 "This phone number is already associated with an account. "
                 "Please log in instead using /login."
             )
             return ConversationHandler.END
 
-        username = context.user_data['username']
-        password = context.user_data['password']
+        username = context.user_data.get('username')
+        password = context.user_data.get('password')
+        if not username or not password:
+            reply_safe(update, "Registration session expired. Please use /registration and try again.")
+            return ConversationHandler.END
 
         # Generate a random unique ID for the user with a minimum of 32 characters
         auser_id = ''.join(random.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(32))
 
         # Save user data to a log file
-        with open(LOG_FILE, 'a') as log_file:
-            user_data = {
-                'username': username,
-                'password': password,
-                'phone_number': phone_number,
-                'chat_id': update.message.chat_id,
-                'user_id': update.message.from_user.id,
-                'name': update.message.from_user.first_name,
-                'auser_id': auser_id,
-            }
-            log_file.write(str(user_data) + '\n')
+        try:
+            with open(LOG_FILE, 'a') as log_file:
+                user_data = {
+                    'username': username,
+                    'password': password,
+                    'phone_number': phone_number,
+                    'chat_id': update.message.chat_id,
+                    'user_id': update.message.from_user.id,
+                    'name': update.message.from_user.first_name,
+                    'auser_id': auser_id,
+                }
+                log_file.write(str(user_data) + '\n')
+        except OSError:
+            logger.exception("Failed to persist registration data")
+            reply_safe(update, "We could not save your registration right now. Please try again shortly.")
+            return ConversationHandler.END
 
         # Create a folder with the name of auser_id under the chat_user directory
         user_folder_path = PRIVATE_CHAT_DIR / auser_id
         os.makedirs(user_folder_path, exist_ok=True)
 
-        update.message.reply_text(
+        reply_safe(update,
             f"Registration successful! Your unique ID is {auser_id}. Use /login to log in."
         )
         return ConversationHandler.END
     else:
-        update.message.reply_text("Please use the 'Share vCard' button to share your vCard.")
+        reply_safe(update, "Please use the 'Share vCard' button to share your vCard.")
         return PHONE_NUMBER
 
 
@@ -125,37 +178,45 @@ def registration_phone_number(update: Update, context: CallbackContext) -> int:
 def login_start(update: Update, context: CallbackContext) -> int:
     user_id = update.message.from_user.id
     if is_registered(user_id):
-        update.message.reply_text("Please enter your username:")
+        reply_safe(update, "Please enter your username:")
         return LOGIN_USERNAME
     else:
-        update.message.reply_text("You are not registered. Please use /registration to register first.")
+        reply_safe(update, "You are not registered. Please use /registration to register first.")
         return ConversationHandler.END
 
 
 def login_username(update: Update, context: CallbackContext) -> int:
-    username = update.message.text
+    username = (update.message.text or '').strip()
+
+    if not username:
+        reply_safe(update, "Username cannot be empty. Please enter your username:")
+        return LOGIN_USERNAME
 
     # Check if the username exists in the log file
     if is_username_exists(username):
         context.user_data['username'] = username
-        update.message.reply_text("Please enter your password:")
+        reply_safe(update, "Please enter your password:")
         return LOGIN_PASSWORD
     else:
-        update.message.reply_text("Invalid username. Please try again or use /registration to register.")
+        reply_safe(update, "Invalid username. Please try again or use /registration to register.")
         return ConversationHandler.END
 
 
 def login_password(update: Update, context: CallbackContext) -> int:
-    user_id = update.message.from_user.id
-    password = update.message.text
+    password = (update.message.text or '').strip()
+    username = context.user_data.get('username')
+
+    if not username:
+        reply_safe(update, "Login session expired. Please use /login again.")
+        return ConversationHandler.END
 
     # Check if the provided password is correct
-    if is_password_correct(context.user_data['username'], password):
-        update.message.reply_text(
+    if is_password_correct(username, password):
+        reply_safe(update,
             f"Login successful! Welcome back! Use /details to see your information.\nUse /chat for start chat :)"
         )
     else:
-        update.message.reply_text("Invalid password. Please try again or use /registration to register.")
+        reply_safe(update, "Invalid password. Please try again or use /registration to register.")
     return ConversationHandler.END
 
 
@@ -164,9 +225,9 @@ def user_details(update: Update, context: CallbackContext) -> None:
     user_id = update.message.from_user.id
     if is_registered(user_id):
         details = get_user_details(user_id)
-        update.message.reply_text(details)
+        reply_safe(update, details)
     else:
-        update.message.reply_text("You are not logged in. Please use /login or /registration to log in.")
+        reply_safe(update, "You are not logged in. Please use /login or /registration to log in.")
 
 
 # Command: /logout
@@ -174,71 +235,61 @@ def logout(update: Update, context: CallbackContext) -> int:
     user_id = update.message.from_user.id
     if is_registered(user_id):
         # You can add any specific logout logic here if needed
-        update.message.reply_text("Logout successful! You have been logged out.")
+        reply_safe(update, "Logout successful! You have been logged out.")
     else:
-        update.message.reply_text("You are not logged in. Please use /login or /registration to log in.")
+        reply_safe(update, "You are not logged in. Please use /login or /registration to log in.")
     return ConversationHandler.END
 
 
 # Command: /cancel
 def cancel(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text("Operation cancelled.")
+    reply_safe(update, "Operation cancelled.")
     return ConversationHandler.END
 
 
 # Check if a username already exists
 def is_username_exists(username: str) -> bool:
-    with open(LOG_FILE, 'r') as log_file:
-        for line in log_file:
-            data = eval(line.strip())
-            if 'username' in data and data['username'] == username:
-                return True
+    for data in iter_user_records() or []:
+        if 'username' in data and data['username'] == username:
+            return True
     return False
 
 
 # Check if a phone number already exists
 def is_phone_number_exists(phone_number: str) -> bool:
-    with open(LOG_FILE, 'r') as log_file:
-        for line in log_file:
-            data = eval(line.strip())
-            if 'phone_number' in data and data['phone_number'] == phone_number:
-                return True
+    for data in iter_user_records() or []:
+        if 'phone_number' in data and data['phone_number'] == phone_number:
+            return True
     return False
 
 
 # Check if a user is registered
 def is_registered(user_id: int) -> bool:
-    with open(LOG_FILE, 'r') as log_file:
-        for line in log_file:
-            data = eval(line.strip())
-            if 'user_id' in data and data['user_id'] == user_id:
-                return True
+    for data in iter_user_records() or []:
+        if 'user_id' in data and data['user_id'] == user_id:
+            return True
     return False
 
 
 # Check if the provided password is correct for the given username
 def is_password_correct(username: str, password: str) -> bool:
-    with open(LOG_FILE, 'r') as log_file:
-        for line in log_file:
-            data = eval(line.strip())
-            if 'username' in data and data['username'] == username and \
-                    'password' in data and data['password'] == password:
-                return True
+    for data in iter_user_records() or []:
+        if 'username' in data and data['username'] == username and \
+                'password' in data and data['password'] == password:
+            return True
     return False
 
 
 # Get user details as a formatted string
 def get_user_details(user_id: int) -> str:
-    with open(LOG_FILE, 'r') as log_file:
-        for line in log_file:
-            data = eval(line.strip())
-            if 'user_id' in data and data['user_id'] == user_id:
-                details = (
-                    f"Name: {data['name']}\n"
-                    f"Phone Number: {data['phone_number']}\n"
-                    f"User ID: {data['auser_id']}"
-                )
-                return details
+    for data in iter_user_records() or []:
+        if 'user_id' in data and data['user_id'] == user_id:
+            details = (
+                f"Name: {data.get('name', 'N/A')}\n"
+                f"Phone Number: {data.get('phone_number', 'N/A')}\n"
+                f"User ID: {data.get('auser_id', 'N/A')}"
+            )
+            return details
     return "User details not found."
 
 
@@ -266,32 +317,47 @@ def register_user(username: str, password: str, phone_number: str, chat_id: int,
 
 # Command: /chat
 def chat_start(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text("Please enter the auser_id you want to chat with:")
+    if not is_registered(update.message.from_user.id):
+        reply_safe(update, "Please register first using /registration before starting a chat.")
+        return ConversationHandler.END
+    reply_safe(update, "Please enter the auser_id you want to chat with:")
     return CHOOSE_CHAT
 
 
 def choose_chat(update: Update, context: CallbackContext) -> int:
-    auser_id = update.message.text
+    auser_id = (update.message.text or '').strip()
+
+    if not auser_id:
+        reply_safe(update, "auser_id cannot be empty. Please enter a valid auser_id:")
+        return CHOOSE_CHAT
 
     # Check if the provided auser_id is valid
-    if is_valid_auser_id(auser_id):
+    if is_valid_auser_id(auser_id) and get_user_data_by_auser_id(auser_id):
         context.user_data['auser_id'] = auser_id
-        update.message.reply_text(f"Chat with {auser_id} initiated. You can start typing your messages.")
+        reply_safe(update, f"Chat with {auser_id} initiated. You can start typing your messages.")
         return CHAT
     else:
-        update.message.reply_text("Invalid auser_id. Please try again or use /chat to start a new chat.")
+        reply_safe(update, "Invalid auser_id. Please try again or use /chat to start a new chat.")
         return CHOOSE_CHAT
 
 
 def chat(update: Update, context: CallbackContext) -> None:
     auser_id = context.user_data.get('auser_id')
     if not auser_id:
-        update.message.reply_text("No active chat. Use /chat to start a new chat.")
+        reply_safe(update, "No active chat. Use /chat to start a new chat.")
+        return
+
+    target_user_data = get_user_data_by_auser_id(auser_id)
+    if not target_user_data:
+        reply_safe(update, "The selected auser_id does not exist. Please start again with /chat.")
         return
 
     # Get user data
     user_data = get_user_data(update.message.from_user.id)
     user_name = user_data.get('name')
+    if not user_name:
+        reply_safe(update, "Could not find your account details. Please use /registration first.")
+        return
 
     # Get the user's auser_id
     user_auser_id = user_data.get('auser_id')
@@ -319,10 +385,14 @@ def chat(update: Update, context: CallbackContext) -> None:
         chat_log_file.write(f"{timestamp} - {user_name}: {update.message.text}\n")
 
     # Send the user's name and message as the first part
-    send_message_to_user(context, auser_id, message_part1)
+    if not send_message_to_user(context, auser_id, message_part1):
+        reply_safe(update, "Message could not be delivered. The recipient may have blocked the bot or is unavailable.")
+        return
 
     # Send the instruction to reply with the auser_id as the second part
-    send_message_to_user(context, auser_id, message_part2)
+    if not send_message_to_user(context, auser_id, message_part2):
+        reply_safe(update, "Message could not be delivered. The recipient may have blocked the bot or is unavailable.")
+        return
     
 
     return REPLY
@@ -331,10 +401,20 @@ def chat(update: Update, context: CallbackContext) -> None:
 def reply(update: Update, context: CallbackContext) -> int:
     user_id = update.message.from_user.id
     auser_id = context.user_data.get('auser_id')
+    if not auser_id:
+        reply_safe(update, "No active chat target found. Please start with /chat.")
+        return ConversationHandler.END
+
+    if not get_user_data_by_auser_id(auser_id):
+        reply_safe(update, "The recipient is no longer available. Please start again with /chat.")
+        return ConversationHandler.END
 
     # Get user data
     user_data = get_user_data(user_id)
     user_name = user_data.get('name')
+    if not user_name:
+        reply_safe(update, "Could not find your account details. Please use /registration first.")
+        return ConversationHandler.END
 
     # Format the message
     formatted_message = f"({user_name}): {update.message.text}"
@@ -353,7 +433,9 @@ def reply(update: Update, context: CallbackContext) -> int:
         chat_log_file.write(f"{timestamp} - {user_name}: {update.message.text}\n")
 
     # Send the formatted message to the other user
-    send_message_to_user(context, auser_id, formatted_message)
+    if not send_message_to_user(context, auser_id, formatted_message):
+        reply_safe(update, "Message could not be delivered. The recipient may have blocked the bot or is unavailable.")
+        return ConversationHandler.END
 
     return REPLY
 
@@ -364,32 +446,35 @@ def is_valid_auser_id(auser_id: str) -> bool:
 
 
 # Modified send_message_to_user function with context parameter
-def send_message_to_user(context: CallbackContext, auser_id: str, message: str) -> None:
+def send_message_to_user(context: CallbackContext, auser_id: str, message: str) -> bool:
     user_data = get_user_data_by_auser_id(auser_id)
     if user_data:
         chat_id = user_data.get('chat_id')
+        if not chat_id:
+            return False
 
-        # Send the message
-        context.bot.send_message(chat_id=chat_id, text=message)
+        try:
+            context.bot.send_message(chat_id=chat_id, text=message)
+            return True
+        except Exception:
+            logger.exception("Failed to send message to chat_id=%s", chat_id)
+            return False
+    return False
 
 
 # Get user data by auser_id
 def get_user_data_by_auser_id(auser_id: str) -> dict:
-    with open(LOG_FILE, 'r') as log_file:
-        for line in log_file:
-            data = eval(line.strip())
-            if 'auser_id' in data and data['auser_id'] == auser_id:
-                return data
+    for data in iter_user_records() or []:
+        if 'auser_id' in data and data['auser_id'] == auser_id:
+            return data
     return {}
 
 
 # Get user data by user_id
 def get_user_data(user_id: int) -> dict:
-    with open(LOG_FILE, 'r') as log_file:
-        for line in log_file:
-            data = eval(line.strip())
-            if 'user_id' in data and data['user_id'] == user_id:
-                return data
+    for data in iter_user_records() or []:
+        if 'user_id' in data and data['user_id'] == user_id:
+            return data
     return {}
 
 
@@ -398,6 +483,14 @@ def error_handler(update: object, context: CallbackContext) -> None:
         logger.error("Polling conflict detected: another bot instance is using this token.")
         return
     logger.exception("Unhandled exception while processing update", exc_info=context.error)
+
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            update.effective_message.reply_text(
+                "Something went wrong while processing your request. Please try again or use /cancel."
+            )
+    except Exception:
+        logger.exception("Failed to send error message to user")
 
 
 def main() -> None:
